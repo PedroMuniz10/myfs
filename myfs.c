@@ -11,6 +11,9 @@
 #define MYFS_MAGIC 0x4D594653 // "MYFS" em Hexadecimal
 #define SUPERBLOCK_SECTOR 1
 #define ROOT_INODE_NUMBER 1
+#define INODE_AREA_SIZE_SECTORS 20
+
+// --- Estruturas Internas ---
 
 typedef struct {
     unsigned int magic;
@@ -19,22 +22,26 @@ typedef struct {
     unsigned int freeBlockStart;
 } Superblock;
 
-// Nome alterado para MyFS_OpenFile para evitar conflito com o Windows.h
+typedef struct {
+    char name[MAX_FILENAME_LENGTH + 1]; 
+    unsigned int inode;                 
+} DirEntry;
+
 typedef struct {
     Inode *inode;
     unsigned int cursor;
     Disk *disk;
     int inUse;
-    int type; // FILETYPE_REGULAR ou FILETYPE_DIR
+    int type; 
 } MyFS_OpenFile;
 
-// Tabela global de ficheiros abertos
 static MyFS_OpenFile fdTable[MAX_FDS];
 
 // --- Funções Auxiliares ---
 
 static void saveSuperblock(Disk *d, Superblock *sb) {
     unsigned char buffer[DISK_SECTORDATASIZE];
+    memset(buffer, 0, DISK_SECTORDATASIZE);
     ul2char(sb->magic, buffer);
     ul2char(sb->blockSize, buffer + 4);
     ul2char(sb->numBlocks, buffer + 8);
@@ -58,7 +65,116 @@ static int getFreeFd() {
     return -1;
 }
 
-// --- Implementação da API MyFS ---
+// Leitura interna de inode (para ler diretorio)
+static int internalReadInode(Disk *d, Inode *inode, char *buf, unsigned int nbytes, unsigned int offset) {
+    Superblock sb;
+    loadSuperblock(d, &sb);
+    
+    unsigned int bytesRead = 0;
+    unsigned int fileSize = inodeGetFileSize(inode);
+    unsigned int currentPos = offset;
+
+    while (bytesRead < nbytes && currentPos < fileSize) {
+        unsigned int blockIdx = currentPos / sb.blockSize;
+        unsigned int blockOffset = currentPos % sb.blockSize;
+        
+        unsigned int sectorAddr = inodeGetBlockAddr(inode, blockIdx);
+        
+        unsigned char sectorData[DISK_SECTORDATASIZE];
+        
+        if (sectorAddr == 0) {
+            memset(sectorData, 0, DISK_SECTORDATASIZE);
+        } else {
+            unsigned int currentSector = sectorAddr + (blockOffset / DISK_SECTORDATASIZE);
+            diskReadSector(d, currentSector, sectorData);
+        }
+        
+        buf[bytesRead] = sectorData[blockOffset % DISK_SECTORDATASIZE];
+        bytesRead++;
+        currentPos++;
+    }
+    return bytesRead;
+}
+
+// Busca Inode pelo nome no diretório raiz
+static unsigned int findInodeInDir(Disk *d, const char *filename) {
+    Inode *root = inodeLoad(ROOT_INODE_NUMBER, d);
+    if (!root) return 0;
+
+    unsigned int size = inodeGetFileSize(root);
+    unsigned int cursor = 0;
+    DirEntry entry;
+
+    while (cursor < size) {
+        int n = internalReadInode(d, root, (char*)&entry, sizeof(DirEntry), cursor);
+        if (n != sizeof(DirEntry)) break;
+
+        if (entry.inode != 0 && strcmp(entry.name, filename) == 0) {
+            free(root);
+            return entry.inode;
+        }
+        cursor += sizeof(DirEntry);
+    }
+    
+    free(root);
+    return 0;
+}
+
+// Adiciona entrada no diretório
+static int addEntryToDir(Disk *d, const char *filename, unsigned int inodeNum) {
+    Inode *root = inodeLoad(ROOT_INODE_NUMBER, d);
+    if (!root) return -1;
+
+    DirEntry newEntry;
+    memset(&newEntry, 0, sizeof(DirEntry));
+    strncpy(newEntry.name, filename, MAX_FILENAME_LENGTH);
+    newEntry.inode = inodeNum;
+
+    unsigned int cursor = inodeGetFileSize(root);
+    Superblock sb;
+    loadSuperblock(d, &sb);
+    
+    unsigned int bytesToWrite = sizeof(DirEntry);
+    unsigned int bytesWritten = 0;
+    char *buf = (char*)&newEntry;
+
+    while (bytesWritten < bytesToWrite) {
+        unsigned int blockIdx = cursor / sb.blockSize;
+        unsigned int blockOffset = cursor % sb.blockSize;
+        
+        unsigned int sectorAddr = inodeGetBlockAddr(root, blockIdx);
+        
+        if (sectorAddr == 0) {
+            sectorAddr = sb.freeBlockStart;
+            if (inodeAddBlock(root, sectorAddr) == -1) {
+                free(root);
+                return -1; 
+            }
+            sb.freeBlockStart += (sb.blockSize / DISK_SECTORDATASIZE);
+            saveSuperblock(d, &sb);
+        }
+
+        unsigned int currentSector = sectorAddr + (blockOffset / DISK_SECTORDATASIZE);
+        unsigned char sectorData[DISK_SECTORDATASIZE];
+        
+        diskReadSector(d, currentSector, sectorData);
+        sectorData[blockOffset % DISK_SECTORDATASIZE] = buf[bytesWritten];
+        diskWriteSector(d, currentSector, sectorData);
+        
+        bytesWritten++;
+        cursor++;
+        
+        if (cursor > inodeGetFileSize(root)) {
+            inodeSetFileSize(root, cursor);
+        }
+    }
+    
+    inodeSave(root);
+    free(root);
+    return 0;
+}
+
+// --- Funções da API ---
 
 int myFSIsIdle(Disk *d) {
     for (int i = 0; i < MAX_FDS; i++) {
@@ -72,15 +188,29 @@ int myFSFormat(Disk *d, unsigned int blockSize) {
     sb.magic = MYFS_MAGIC;
     sb.blockSize = blockSize;
     
-    unsigned int dataStart = inodeAreaBeginSector() + 20; 
+    // Define onde começam os dados (depois da área reservada para inodes)
+    unsigned int startInodes = inodeAreaBeginSector();
+    unsigned int dataStart = startInodes + INODE_AREA_SIZE_SECTORS; 
     sb.freeBlockStart = dataStart;
-    sb.numBlocks = (diskGetNumSectors(d) - dataStart) / (blockSize / DISK_SECTORDATASIZE);
+    
+    unsigned int totalSectors = diskGetNumSectors(d);
+    sb.numBlocks = (totalSectors - dataStart) / (blockSize / DISK_SECTORDATASIZE);
+
+    unsigned char zeroBuf[DISK_SECTORDATASIZE];
+    memset(zeroBuf, 0, DISK_SECTORDATASIZE);
+    for (unsigned int i = 0; i < INODE_AREA_SIZE_SECTORS; i++) {
+        diskWriteSector(d, startInodes + i, zeroBuf);
+    }
+    // -----------------------
 
     saveSuperblock(d, &sb);
 
     Inode *root = inodeCreate(ROOT_INODE_NUMBER, d);
-    inodeSetFileType(root, FILETYPE_DIR);
-    inodeSave(root);
+    if (root) {
+        inodeSetFileType(root, FILETYPE_DIR);
+        inodeSave(root);
+        free(root);
+    }
 
     return sb.numBlocks;
 }
@@ -99,23 +229,48 @@ int myFSOpen(Disk *d, const char *path) {
     int fdIdx = getFreeFd();
     if (fdIdx == -1) return -1;
 
-    unsigned int inumber = 0;
-    // Busca simples por um i-node livre a partir do 2 (1 é a raiz)
-    for(unsigned int i = 2; i < 100; i++) {
-        Inode *temp = inodeLoad(i, d);
-        if (temp == NULL) { inumber = i; break; }
+    const char *name = (path[0] == '/') ? path + 1 : path;
+    
+    unsigned int inumber = findInodeInDir(d, name);
+
+    int isNew = 0;
+
+    if (inumber == 0) {
+        for (unsigned int i = 2; i < 200; i++) {
+            Inode *temp = inodeLoad(i, d);
+            if (temp) {
+                if (inodeGetFileType(temp) == 0) { 
+                    inumber = i;
+                    free(temp);
+                    break;
+                }
+                free(temp);
+            }
+        }
+        
+        if (inumber == 0) {
+            return -1;
+        }
+
+        Inode *newInode = inodeCreate(inumber, d);
+        if (!newInode) return -1;
+        
+        inodeSetFileType(newInode, FILETYPE_REGULAR);
+        inodeSave(newInode);
+        free(newInode);
+
+        if (addEntryToDir(d, name, inumber) != 0) return -1;
+        isNew = 1;
     }
 
-    if (inumber == 0) return -1;
+    Inode *inodeObj = inodeLoad(inumber, d);
+    if (!inodeObj) return -1;
 
-    Inode *newInode = inodeCreate(inumber, d);
-    inodeSetFileType(newInode, FILETYPE_REGULAR);
-    
-    fdTable[fdIdx].inode = newInode;
+    fdTable[fdIdx].inode = inodeObj;
     fdTable[fdIdx].cursor = 0;
     fdTable[fdIdx].disk = d;
     fdTable[fdIdx].inUse = 1;
-    fdTable[fdIdx].type = FILETYPE_REGULAR;
+    fdTable[fdIdx].type = isNew ? FILETYPE_REGULAR : inodeGetFileType(inodeObj);
 
     return fdIdx + 1;
 }
@@ -123,26 +278,9 @@ int myFSOpen(Disk *d, const char *path) {
 int myFSRead(int fd, char *buf, unsigned int nbytes) {
     MyFS_OpenFile *file = &fdTable[fd - 1];
     if (!file->inUse) return -1;
-
-    Superblock sb;
-    loadSuperblock(file->disk, &sb);
-
-    unsigned int bytesRead = 0;
-    while (bytesRead < nbytes) {
-        unsigned int blockIdx = file->cursor / sb.blockSize;
-        unsigned int blockOffset = file->cursor % sb.blockSize;
-        
-        unsigned int sectorAddr = inodeGetBlockAddr(file->inode, blockIdx);
-        if (sectorAddr == 0) break; 
-
-        unsigned char sectorData[DISK_SECTORDATASIZE];
-        unsigned int currentSector = sectorAddr + (blockOffset / DISK_SECTORDATASIZE);
-        diskReadSector(file->disk, currentSector, sectorData);
-        
-        buf[bytesRead] = sectorData[blockOffset % DISK_SECTORDATASIZE];
-        bytesRead++;
-        file->cursor++;
-    }
+    
+    int bytesRead = internalReadInode(file->disk, file->inode, buf, nbytes, file->cursor);
+    if (bytesRead > 0) file->cursor += bytesRead;
     return bytesRead;
 }
 
@@ -159,22 +297,28 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes) {
         unsigned int blockOffset = file->cursor % sb.blockSize;
 
         unsigned int sectorAddr = inodeGetBlockAddr(file->inode, blockIdx);
+        
         if (sectorAddr == 0) {
             sectorAddr = sb.freeBlockStart;
-            inodeAddBlock(file->inode, sectorAddr);
+            if (inodeAddBlock(file->inode, sectorAddr) == -1) break; 
+            
             sb.freeBlockStart += (sb.blockSize / DISK_SECTORDATASIZE);
             saveSuperblock(file->disk, &sb);
         }
 
-        unsigned char sectorData[DISK_SECTORDATASIZE];
         unsigned int currentSector = sectorAddr + (blockOffset / DISK_SECTORDATASIZE);
-        diskReadSector(file->disk, currentSector, sectorData);
+        unsigned char sectorData[DISK_SECTORDATASIZE];
         
+        diskReadSector(file->disk, currentSector, sectorData);
         sectorData[blockOffset % DISK_SECTORDATASIZE] = buf[bytesWritten];
         diskWriteSector(file->disk, currentSector, sectorData);
 
         bytesWritten++;
         file->cursor++;
+        
+        if (file->cursor > inodeGetFileSize(file->inode)) {
+            inodeSetFileSize(file->inode, file->cursor);
+        }
     }
     inodeSave(file->inode);
     return bytesWritten;
@@ -184,46 +328,55 @@ int myFSClose(int fd) {
     if (fd <= 0 || fd > MAX_FDS) return -1;
     if (fdTable[fd - 1].inUse) {
         inodeSave(fdTable[fd - 1].inode);
+        free(fdTable[fd - 1].inode); 
         fdTable[fd - 1].inUse = 0;
     }
     return 0;
 }
 
 int myFSOpenDir(Disk *d, const char *path) {
-    int fdIdx = getFreeFd();
-    if (fdIdx == -1) return -1;
-
-    fdTable[fdIdx].inode = inodeLoad(ROOT_INODE_NUMBER, d);
-    fdTable[fdIdx].cursor = 0;
-    fdTable[fdIdx].disk = d;
-    fdTable[fdIdx].inUse = 1;
-    fdTable[fdIdx].type = FILETYPE_DIR;
-
-    return fdIdx + 1;
+    if (path[0] == '/' && path[1] == '\0') {
+        int fdIdx = getFreeFd();
+        if (fdIdx == -1) return -1;
+        
+        fdTable[fdIdx].inode = inodeLoad(ROOT_INODE_NUMBER, d);
+        fdTable[fdIdx].cursor = 0;
+        fdTable[fdIdx].disk = d;
+        fdTable[fdIdx].inUse = 1;
+        fdTable[fdIdx].type = FILETYPE_DIR;
+        return fdIdx + 1;
+    }
+    return -1;
 }
 
 int myFSReadDir(int fd, char *filename, unsigned int *inumber) {
-    // Retorna 0 para indicar fim de diretório ou que não há ficheiros listados
-    // Necessário implementar a estrutura de entrada de diretório para listagem real
+    MyFS_OpenFile *file = &fdTable[fd - 1];
+    if (!file->inUse || file->type != FILETYPE_DIR) return -1;
+
+    DirEntry entry;
+    int bytesRead = myFSRead(fd, (char*)&entry, sizeof(DirEntry));
+    if (bytesRead != sizeof(DirEntry)) return 0;
+
+    if (entry.inode != 0) {
+        strncpy(filename, entry.name, MAX_FILENAME_LENGTH);
+        *inumber = entry.inode;
+        return 1;
+    }
     return 0; 
 }
 
 int myFSLink(int fd, const char *filename, unsigned int inumber) {
-    return 0;
+    if (fd <= 0 || fd > MAX_FDS || !fdTable[fd-1].inUse) return -1;
+    return addEntryToDir(fdTable[fd-1].disk, filename, inumber);
 }
 
-int myFSUnlink(int fd, const char *filename) {
-    return 0;
-}
-
-int myFSCloseDir(int fd) {
-    return myFSClose(fd);
-}
+int myFSUnlink(int fd, const char *filename) { return 0; }
+int myFSCloseDir(int fd) { return myFSClose(fd); }
 
 int installMyFS(void) {
     static FSInfo info;
     info.fsid = 1;
-    info.fsname = "MyFS_Standard";
+    info.fsname = "MyFS_Final";
     info.isidleFn = myFSIsIdle;
     info.formatFn = myFSFormat;
     info.xMountFn = myFSxMount;
@@ -236,6 +389,5 @@ int installMyFS(void) {
     info.linkFn = myFSLink;
     info.unlinkFn = myFSUnlink;
     info.closedirFn = myFSCloseDir;
-
     return vfsRegisterFS(&info);
 }
