@@ -74,22 +74,24 @@ static int internalReadInode(Disk *d, Inode *inode, char *buf, unsigned int nbyt
     unsigned int fileSize = inodeGetFileSize(inode);
     unsigned int currentPos = offset;
 
+    unsigned int blockSizeBytes = sb.blockSize * DISK_SECTORDATASIZE;
+
     while (bytesRead < nbytes && currentPos < fileSize) {
-        unsigned int blockIdx = currentPos / sb.blockSize;
-        unsigned int blockOffset = currentPos % sb.blockSize;
+        unsigned int blockIdx = currentPos / blockSizeBytes;
+        unsigned int blockOffset = currentPos % blockSizeBytes;
         
         unsigned int sectorAddr = inodeGetBlockAddr(inode, blockIdx);
-        
         unsigned char sectorData[DISK_SECTORDATASIZE];
         
         if (sectorAddr == 0) {
-            memset(sectorData, 0, DISK_SECTORDATASIZE);
+            buf[bytesRead] = 0;
         } else {
             unsigned int currentSector = sectorAddr + (blockOffset / DISK_SECTORDATASIZE);
+            unsigned int byteInSector = blockOffset % DISK_SECTORDATASIZE;
             diskReadSector(d, currentSector, sectorData);
+            buf[bytesRead] = sectorData[byteInSector];
         }
         
-        buf[bytesRead] = sectorData[blockOffset % DISK_SECTORDATASIZE];
         bytesRead++;
         currentPos++;
     }
@@ -123,52 +125,36 @@ static unsigned int findInodeInDir(Disk *d, const char *filename) {
 // Adiciona entrada no diretório
 static int addEntryToDir(Disk *d, const char *filename, unsigned int inodeNum) {
     Inode *root = inodeLoad(ROOT_INODE_NUMBER, d);
-    if (!root) return -1;
+    Superblock sb;
+    loadSuperblock(d, &sb);
 
     DirEntry newEntry;
     memset(&newEntry, 0, sizeof(DirEntry));
     strncpy(newEntry.name, filename, MAX_FILENAME_LENGTH);
     newEntry.inode = inodeNum;
 
-    unsigned int cursor = inodeGetFileSize(root);
-    Superblock sb;
-    loadSuperblock(d, &sb);
+    unsigned int fileSize = inodeGetFileSize(root);
+    unsigned int blockSizeBytes = sb.blockSize * DISK_SECTORDATASIZE;
     
-    unsigned int bytesToWrite = sizeof(DirEntry);
-    unsigned int bytesWritten = 0;
-    char *buf = (char*)&newEntry;
+    unsigned int blockIdx = fileSize / blockSizeBytes;
+    unsigned int offsetInBlock = fileSize % blockSizeBytes;
+    unsigned int sectorAddr = inodeGetBlockAddr(root, blockIdx);
 
-    while (bytesWritten < bytesToWrite) {
-        unsigned int blockIdx = cursor / sb.blockSize;
-        unsigned int blockOffset = cursor % sb.blockSize;
-        
-        unsigned int sectorAddr = inodeGetBlockAddr(root, blockIdx);
-        
-        if (sectorAddr == 0) {
-            sectorAddr = sb.freeBlockStart;
-            if (inodeAddBlock(root, sectorAddr) == -1) {
-                free(root);
-                return -1; 
-            }
-            sb.freeBlockStart += (sb.blockSize / DISK_SECTORDATASIZE);
-            saveSuperblock(d, &sb);
-        }
-
-        unsigned int currentSector = sectorAddr + (blockOffset / DISK_SECTORDATASIZE);
-        unsigned char sectorData[DISK_SECTORDATASIZE];
-        
-        diskReadSector(d, currentSector, sectorData);
-        sectorData[blockOffset % DISK_SECTORDATASIZE] = buf[bytesWritten];
-        diskWriteSector(d, currentSector, sectorData);
-        
-        bytesWritten++;
-        cursor++;
-        
-        if (cursor > inodeGetFileSize(root)) {
-            inodeSetFileSize(root, cursor);
-        }
+    if (sectorAddr == 0) {
+        sectorAddr = sb.freeBlockStart;
+        inodeAddBlock(root, sectorAddr);
+        sb.freeBlockStart += sb.blockSize;
+        saveSuperblock(d, &sb);
     }
+
+    unsigned int targetSector = sectorAddr + (offsetInBlock / DISK_SECTORDATASIZE);
+    unsigned char sectorData[DISK_SECTORDATASIZE];
     
+    diskReadSector(d, targetSector, sectorData);
+    memcpy(&sectorData[offsetInBlock % DISK_SECTORDATASIZE], &newEntry, sizeof(DirEntry));
+    diskWriteSector(d, targetSector, sectorData);
+
+    inodeSetFileSize(root, fileSize + sizeof(DirEntry));
     inodeSave(root);
     free(root);
     return 0;
@@ -188,7 +174,6 @@ int myFSFormat(Disk *d, unsigned int blockSize) {
     sb.magic = MYFS_MAGIC;
     sb.blockSize = blockSize;
     
-    // Define onde começam os dados (depois da área reservada para inodes)
     unsigned int startInodes = inodeAreaBeginSector();
     unsigned int dataStart = startInodes + INODE_AREA_SIZE_SECTORS; 
     sb.freeBlockStart = dataStart;
@@ -216,7 +201,7 @@ int myFSFormat(Disk *d, unsigned int blockSize) {
 }
 
 int myFSxMount(Disk *d, int x) {
-    if (x == 1) { // Montar
+    if (x == 1) {
         Superblock sb;
         loadSuperblock(d, &sb);
         if (sb.magic != MYFS_MAGIC) return 0;
@@ -278,9 +263,35 @@ int myFSOpen(Disk *d, const char *path) {
 int myFSRead(int fd, char *buf, unsigned int nbytes) {
     MyFS_OpenFile *file = &fdTable[fd - 1];
     if (!file->inUse) return -1;
+
+    Superblock sb;
+    loadSuperblock(file->disk, &sb);
     
-    int bytesRead = internalReadInode(file->disk, file->inode, buf, nbytes, file->cursor);
-    if (bytesRead > 0) file->cursor += bytesRead;
+    unsigned int blockSizeBytes = sb.blockSize * DISK_SECTORDATASIZE;
+    unsigned int bytesRead = 0;
+    unsigned int fileSize = inodeGetFileSize(file->inode);
+
+    while (bytesRead < nbytes && file->cursor < fileSize) {
+        unsigned int blockIdx = file->cursor / blockSizeBytes;
+        unsigned int blockOffset = file->cursor % blockSizeBytes;
+        
+        unsigned int sectorAddr = inodeGetBlockAddr(file->inode, blockIdx);
+        
+        if (sectorAddr == 0) {
+            buf[bytesRead] = 0;
+        } else {
+            unsigned int currentSector = sectorAddr + (blockOffset / DISK_SECTORDATASIZE);
+            unsigned int byteInSector = blockOffset % DISK_SECTORDATASIZE;
+            
+            unsigned char sectorData[DISK_SECTORDATASIZE];
+            if (diskReadSector(file->disk, currentSector, sectorData) != 0) break;
+            
+            buf[bytesRead] = sectorData[byteInSector];
+        }
+        
+        bytesRead++;
+        file->cursor++;
+    }
     return bytesRead;
 }
 
@@ -291,10 +302,12 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes) {
     Superblock sb;
     loadSuperblock(file->disk, &sb);
 
+    unsigned int blockSizeBytes = sb.blockSize * DISK_SECTORDATASIZE;
     unsigned int bytesWritten = 0;
+
     while (bytesWritten < nbytes) {
-        unsigned int blockIdx = file->cursor / sb.blockSize;
-        unsigned int blockOffset = file->cursor % sb.blockSize;
+        unsigned int blockIdx = file->cursor / blockSizeBytes;
+        unsigned int blockOffset = file->cursor % blockSizeBytes;
 
         unsigned int sectorAddr = inodeGetBlockAddr(file->inode, blockIdx);
         
@@ -302,15 +315,17 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes) {
             sectorAddr = sb.freeBlockStart;
             if (inodeAddBlock(file->inode, sectorAddr) == -1) break; 
             
-            sb.freeBlockStart += (sb.blockSize / DISK_SECTORDATASIZE);
+            sb.freeBlockStart += sb.blockSize;
             saveSuperblock(file->disk, &sb);
         }
 
         unsigned int currentSector = sectorAddr + (blockOffset / DISK_SECTORDATASIZE);
+        unsigned int byteInSector = blockOffset % DISK_SECTORDATASIZE;
+        
         unsigned char sectorData[DISK_SECTORDATASIZE];
         
         diskReadSector(file->disk, currentSector, sectorData);
-        sectorData[blockOffset % DISK_SECTORDATASIZE] = buf[bytesWritten];
+        sectorData[byteInSector] = buf[bytesWritten];
         diskWriteSector(file->disk, currentSector, sectorData);
 
         bytesWritten++;
@@ -320,6 +335,7 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes) {
             inodeSetFileSize(file->inode, file->cursor);
         }
     }
+
     inodeSave(file->inode);
     return bytesWritten;
 }
@@ -351,16 +367,14 @@ int myFSOpenDir(Disk *d, const char *path) {
 
 int myFSReadDir(int fd, char *filename, unsigned int *inumber) {
     MyFS_OpenFile *file = &fdTable[fd - 1];
-    if (!file->inUse || file->type != FILETYPE_DIR) return -1;
-
     DirEntry entry;
-    int bytesRead = myFSRead(fd, (char*)&entry, sizeof(DirEntry));
-    if (bytesRead != sizeof(DirEntry)) return 0;
 
-    if (entry.inode != 0) {
-        strncpy(filename, entry.name, MAX_FILENAME_LENGTH);
-        *inumber = entry.inode;
-        return 1;
+    while (myFSRead(fd, (char*)&entry, sizeof(DirEntry)) == sizeof(DirEntry)) {
+        if (entry.inode != 0) {
+            strncpy(filename, entry.name, MAX_FILENAME_LENGTH);
+            *inumber = entry.inode;
+            return 1;
+        }
     }
     return 0; 
 }
