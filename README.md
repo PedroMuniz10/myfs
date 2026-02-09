@@ -2,6 +2,17 @@
 
 Implementação de um sistema de arquivos próprio para um Sistema Operacional hipotético, desenvolvido como trabalho prático da disciplina *Sistemas Operacionais* da Universidade Federal de Juiz de Fora (UFJF).
 
+---
+
+## 👨‍💻 Desenvolvedores
+
+- João Paulo Macedo 
+- Pedro Muniz 
+- Igor Rocha
+- Romulo Ferreira
+
+---
+
 ## 📌 Descrição
 
 Este projeto consiste na implementação de um sistema de arquivos chamado **MyFS**,
